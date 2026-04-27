@@ -16,6 +16,7 @@ void main() {
 
 @pragma('vm:entry-point')
 Future<void> backgroundMessageHandler(SmsMessage message) async {
+  debugPrint('[SMS][bg] received from=${message.address} body=${message.body}');
   await MessageStore.prepend(_StoredMessage.fromSms(message));
 }
 
@@ -120,7 +121,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _refreshFromStorage();
+      _syncFromInbox();
     }
   }
 
@@ -146,24 +147,25 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
       final granted =
           await _telephony.requestPhoneAndSmsPermissions ?? false;
+      debugPrint('[SMS] permission granted=$granted');
       if (!granted) {
         setState(() {
           _loading = false;
-          _error = 'SMS permission denied.';
+          _error = 'SMS permission denied. Enable it in Settings → Apps → expense_tracker → Permissions.';
         });
         return;
       }
 
-      if (cached.isEmpty) {
-        await _seedFromInbox();
-      }
+      await _syncFromInbox();
 
       _telephony.listenIncomingSms(
         onNewMessage: _onForegroundSms,
         onBackgroundMessage: backgroundMessageHandler,
         listenInBackground: true,
       );
-    } catch (e) {
+      debugPrint('[SMS] listener registered');
+    } catch (e, st) {
+      debugPrint('[SMS] bootstrap error: $e\n$st');
       if (!mounted) return;
       setState(() {
         _loading = false;
@@ -172,36 +174,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _seedFromInbox() async {
-    final inbox = await _telephony.getInboxSms(
-      columns: [SmsColumn.ADDRESS, SmsColumn.BODY, SmsColumn.DATE],
-      sortOrder: [OrderBy(SmsColumn.DATE, sort: Sort.DESC)],
-    );
+  Future<void> _syncFromInbox() async {
+    try {
+      final inbox = await _telephony.getInboxSms(
+        columns: [SmsColumn.ADDRESS, SmsColumn.BODY, SmsColumn.DATE],
+        sortOrder: [OrderBy(SmsColumn.DATE, sort: Sort.DESC)],
+      );
 
-    final seeded = inbox
-        .take(kCardCount)
-        .map(_StoredMessage.fromSms)
-        .toList();
+      final latest = inbox
+          .take(kCardCount)
+          .map(_StoredMessage.fromSms)
+          .toList();
 
-    await MessageStore.save(seeded);
-    if (!mounted) return;
-    setState(() {
-      _messages = seeded;
-      _loading = false;
-      _error = null;
-    });
+      debugPrint('[SMS] inbox sync: pulled ${latest.length} messages');
+
+      await MessageStore.save(latest);
+      if (!mounted) return;
+      setState(() {
+        _messages = latest;
+        _loading = false;
+        _error = null;
+      });
+    } catch (e) {
+      debugPrint('[SMS] inbox sync error: $e');
+    }
   }
 
   Future<void> _onForegroundSms(SmsMessage message) async {
+    debugPrint('[SMS][fg] received from=${message.address} body=${message.body}');
     final updated = await MessageStore.prepend(_StoredMessage.fromSms(message));
     if (!mounted) return;
     setState(() => _messages = updated);
-  }
-
-  Future<void> _refreshFromStorage() async {
-    final cached = await MessageStore.load();
-    if (!mounted) return;
-    setState(() => _messages = cached);
   }
 
   @override
