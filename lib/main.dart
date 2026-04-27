@@ -5,12 +5,16 @@ import 'dart:io' show Platform;
 import 'package:another_telephony/telephony.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 const int kCardCount = 8;
 const String _kMessagesKey = 'cached_messages_v1';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await NotificationService.init();
+  await NotificationService.requestPermission();
   runApp(const ExpenseTrackerApp());
 }
 
@@ -18,6 +22,73 @@ void main() {
 Future<void> backgroundMessageHandler(SmsMessage message) async {
   debugPrint('[SMS][bg] received from=${message.address} body=${message.body}');
   await MessageStore.prepend(_StoredMessage.fromSms(message));
+  await NotificationService.init();
+  await NotificationService.showCaptured(
+    sender: message.address ?? 'Unknown',
+    body: message.body ?? '',
+  );
+}
+
+class NotificationService {
+  static const String _channelId = 'sms_capture';
+  static const String _channelName = 'SMS Capture';
+  static const String _channelDesc = 'Notifies when an SMS is recorded';
+
+  static final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
+
+  static bool _initialized = false;
+
+  static Future<void> init() async {
+    if (_initialized) return;
+    const androidSettings =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+    const initSettings = InitializationSettings(android: androidSettings);
+    await _plugin.initialize(initSettings);
+
+    final androidImpl = _plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    await androidImpl?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _channelId,
+        _channelName,
+        description: _channelDesc,
+        importance: Importance.high,
+      ),
+    );
+
+    _initialized = true;
+  }
+
+  static Future<void> requestPermission() async {
+    final androidImpl = _plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    await androidImpl?.requestNotificationsPermission();
+  }
+
+  static Future<void> showCaptured({
+    required String sender,
+    required String body,
+  }) async {
+    const details = NotificationDetails(
+      android: AndroidNotificationDetails(
+        _channelId,
+        _channelName,
+        channelDescription: _channelDesc,
+        importance: Importance.high,
+        priority: Priority.high,
+        ticker: 'SMS recorded',
+      ),
+    );
+    final preview = body.length > 80 ? '${body.substring(0, 80)}...' : body;
+    final id = DateTime.now().millisecondsSinceEpoch.remainder(1 << 31);
+    await _plugin.show(
+      id,
+      'Message recorded',
+      sender.isEmpty ? preview : 'From $sender · $preview',
+      details,
+    );
+  }
 }
 
 class _StoredMessage {
@@ -203,6 +274,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _onForegroundSms(SmsMessage message) async {
     debugPrint('[SMS][fg] received from=${message.address} body=${message.body}');
     final updated = await MessageStore.prepend(_StoredMessage.fromSms(message));
+    await NotificationService.showCaptured(
+      sender: message.address ?? 'Unknown',
+      body: message.body ?? '',
+    );
     if (!mounted) return;
     setState(() => _messages = updated);
   }
