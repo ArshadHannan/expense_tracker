@@ -1,11 +1,77 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io' show Platform;
 
 import 'package:another_telephony/telephony.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+const int kCardCount = 8;
+const String _kMessagesKey = 'cached_messages_v1';
 
 void main() {
   runApp(const ExpenseTrackerApp());
+}
+
+@pragma('vm:entry-point')
+Future<void> backgroundMessageHandler(SmsMessage message) async {
+  await MessageStore.prepend(_StoredMessage.fromSms(message));
+}
+
+class _StoredMessage {
+  _StoredMessage({required this.address, required this.body, required this.date});
+
+  final String address;
+  final String body;
+  final int date;
+
+  factory _StoredMessage.fromSms(SmsMessage m) => _StoredMessage(
+        address: m.address ?? '',
+        body: m.body ?? '',
+        date: m.date ?? DateTime.now().millisecondsSinceEpoch,
+      );
+
+  factory _StoredMessage.fromJson(Map<String, dynamic> j) => _StoredMessage(
+        address: j['address'] as String? ?? '',
+        body: j['body'] as String? ?? '',
+        date: j['date'] as int? ?? 0,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'address': address,
+        'body': body,
+        'date': date,
+      };
+}
+
+class MessageStore {
+  static Future<List<_StoredMessage>> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kMessagesKey);
+    if (raw == null || raw.isEmpty) return const [];
+    try {
+      final list = jsonDecode(raw) as List<dynamic>;
+      return list
+          .map((e) => _StoredMessage.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  static Future<void> save(List<_StoredMessage> messages) async {
+    final prefs = await SharedPreferences.getInstance();
+    final encoded = jsonEncode(messages.map((m) => m.toJson()).toList());
+    await prefs.setString(_kMessagesKey, encoded);
+  }
+
+  static Future<List<_StoredMessage>> prepend(_StoredMessage message) async {
+    final current = await load();
+    final updated = [message, ...current].take(kCardCount).toList();
+    await save(updated);
+    return updated;
+  }
 }
 
 class ExpenseTrackerApp extends StatelessWidget {
@@ -32,25 +98,37 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
-  static const int _cardCount = 8;
-
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final Telephony _telephony = Telephony.instance;
-  List<SmsMessage> _messages = const [];
+  List<_StoredMessage> _messages = const [];
   bool _loading = true;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    _initSms();
+    WidgetsBinding.instance.addObserver(this);
+    _bootstrap();
   }
 
-  Future<void> _initSms() async {
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _refreshFromStorage();
+    }
+  }
+
+  Future<void> _bootstrap() async {
     if (kIsWeb || !Platform.isAndroid) {
       setState(() {
         _loading = false;
-        _error = Platform.isIOS
+        _error = (!kIsWeb && Platform.isIOS)
             ? 'iOS does not allow apps to read SMS messages.'
             : 'SMS is only supported on Android.';
       });
@@ -58,6 +136,14 @@ class _HomePageState extends State<HomePage> {
     }
 
     try {
+      final cached = await MessageStore.load();
+      if (mounted && cached.isNotEmpty) {
+        setState(() {
+          _messages = cached;
+          _loading = false;
+        });
+      }
+
       final granted =
           await _telephony.requestPhoneAndSmsPermissions ?? false;
       if (!granted) {
@@ -68,43 +154,54 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
-      await _loadInbox();
+      if (cached.isEmpty) {
+        await _seedFromInbox();
+      }
 
       _telephony.listenIncomingSms(
-        onNewMessage: (SmsMessage message) {
-          if (!mounted) return;
-          setState(() {
-            _messages = [message, ..._messages].take(_cardCount).toList();
-          });
-        },
-        listenInBackground: false,
+        onNewMessage: _onForegroundSms,
+        onBackgroundMessage: backgroundMessageHandler,
+        listenInBackground: true,
       );
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = 'Failed to load SMS: $e';
+        _error = 'Failed to initialize SMS: $e';
       });
     }
   }
 
-  Future<void> _loadInbox() async {
+  Future<void> _seedFromInbox() async {
     final inbox = await _telephony.getInboxSms(
-      columns: [
-        SmsColumn.ADDRESS,
-        SmsColumn.BODY,
-        SmsColumn.DATE,
-      ],
-      sortOrder: [
-        OrderBy(SmsColumn.DATE, sort: Sort.DESC),
-      ],
+      columns: [SmsColumn.ADDRESS, SmsColumn.BODY, SmsColumn.DATE],
+      sortOrder: [OrderBy(SmsColumn.DATE, sort: Sort.DESC)],
     );
 
+    final seeded = inbox
+        .take(kCardCount)
+        .map(_StoredMessage.fromSms)
+        .toList();
+
+    await MessageStore.save(seeded);
     if (!mounted) return;
     setState(() {
-      _messages = inbox.take(_cardCount).toList();
+      _messages = seeded;
       _loading = false;
       _error = null;
     });
+  }
+
+  Future<void> _onForegroundSms(SmsMessage message) async {
+    final updated = await MessageStore.prepend(_StoredMessage.fromSms(message));
+    if (!mounted) return;
+    setState(() => _messages = updated);
+  }
+
+  Future<void> _refreshFromStorage() async {
+    final cached = await MessageStore.load();
+    if (!mounted) return;
+    setState(() => _messages = cached);
   }
 
   @override
@@ -116,7 +213,7 @@ class _HomePageState extends State<HomePage> {
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: _loading ? null : _initSms,
+            onPressed: _loading ? null : _bootstrap,
             tooltip: 'Refresh',
           ),
         ],
@@ -145,7 +242,7 @@ class _HomePageState extends State<HomePage> {
     return Padding(
       padding: const EdgeInsets.all(16),
       child: GridView.builder(
-        itemCount: _cardCount,
+        itemCount: kCardCount,
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: 2,
           mainAxisSpacing: 16,
@@ -165,13 +262,15 @@ class _MessageCard extends StatelessWidget {
   const _MessageCard({required this.index, required this.message});
 
   final int index;
-  final SmsMessage? message;
+  final _StoredMessage? message;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final hasMessage = message != null;
-    final sender = message?.address ?? 'Empty';
+    final sender = message?.address.isNotEmpty == true
+        ? message!.address
+        : (hasMessage ? 'Unknown' : 'Empty');
     final body = message?.body ?? 'No message';
 
     return Card(
@@ -220,9 +319,9 @@ class _MessageCard extends StatelessWidget {
                   style: theme.textTheme.bodySmall,
                 ),
               ),
-              if (message?.date != null)
+              if (hasMessage && message!.date > 0)
                 Text(
-                  _formatDate(message!.date!),
+                  _formatDate(message!.date),
                   style: theme.textTheme.labelSmall?.copyWith(
                     color: theme.colorScheme.outline,
                   ),
@@ -238,8 +337,8 @@ class _MessageCard extends StatelessWidget {
     showDialog<void>(
       context: context,
       builder: (_) => AlertDialog(
-        title: Text(message!.address ?? 'Message'),
-        content: SingleChildScrollView(child: Text(message!.body ?? '')),
+        title: Text(message!.address.isNotEmpty ? message!.address : 'Message'),
+        content: SingleChildScrollView(child: Text(message!.body)),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(),
@@ -252,7 +351,7 @@ class _MessageCard extends StatelessWidget {
 
   static String _formatDate(int millis) {
     final date = DateTime.fromMillisecondsSinceEpoch(millis);
-    final two = (int n) => n.toString().padLeft(2, '0');
+    String two(int n) => n.toString().padLeft(2, '0');
     return '${date.year}-${two(date.month)}-${two(date.day)} '
         '${two(date.hour)}:${two(date.minute)}';
   }
