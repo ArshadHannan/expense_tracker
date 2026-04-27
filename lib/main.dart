@@ -63,7 +63,8 @@ class NotificationService {
   static Future<void> requestPermission() async {
     final androidImpl = _plugin.resolvePlatformSpecificImplementation<
         AndroidFlutterLocalNotificationsPlugin>();
-    await androidImpl?.requestNotificationsPermission();
+    final granted = await androidImpl?.requestNotificationsPermission();
+    debugPrint('[NOTIF] permission granted=$granted');
   }
 
   static Future<void> showCaptured({
@@ -82,12 +83,17 @@ class NotificationService {
     );
     final preview = body.length > 80 ? '${body.substring(0, 80)}...' : body;
     final id = DateTime.now().millisecondsSinceEpoch.remainder(1 << 31);
-    await _plugin.show(
-      id,
-      'Message recorded',
-      sender.isEmpty ? preview : 'From $sender · $preview',
-      details,
-    );
+    debugPrint('[NOTIF] showing id=$id from=$sender');
+    try {
+      await _plugin.show(
+        id,
+        'Message recorded',
+        sender.isEmpty ? preview : 'From $sender · $preview',
+        details,
+      );
+    } catch (e) {
+      debugPrint('[NOTIF] show failed: $e');
+    }
   }
 }
 
