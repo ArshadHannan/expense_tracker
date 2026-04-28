@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'overlay_popup.dart';
+
 const int kCardCount = 8;
 const String _kMessagesKey = 'cached_messages_v1';
 
@@ -23,10 +25,10 @@ Future<void> backgroundMessageHandler(SmsMessage message) async {
   debugPrint('[SMS][bg] received from=${message.address} body=${message.body}');
   await MessageStore.prepend(_StoredMessage.fromSms(message));
   await NotificationService.init();
-  await NotificationService.showCaptured(
-    sender: message.address ?? 'Unknown',
-    body: message.body ?? '',
-  );
+  final sender = message.address ?? 'Unknown';
+  final body = message.body ?? '';
+  await NotificationService.showCaptured(sender: sender, body: body);
+  await OverlayPopupService.showSmsPopup(sender: sender, body: body);
 }
 
 class NotificationService {
@@ -181,6 +183,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   List<_StoredMessage> _messages = const [];
   bool _loading = true;
   String? _error;
+  bool _overlayPermissionGranted = false;
 
   @override
   void initState() {
@@ -199,7 +202,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _syncFromInbox();
+      _refreshOverlayPermission();
     }
+  }
+
+  Future<void> _refreshOverlayPermission() async {
+    final granted = await OverlayPopupService.isPermissionGranted();
+    if (!mounted) return;
+    setState(() => _overlayPermissionGranted = granted);
+  }
+
+  Future<void> _requestOverlayPermission() async {
+    await OverlayPopupService.requestPermission();
+    // The system settings screen takes the user out of the app; the resumed
+    // lifecycle hook above will re-check the permission when they return.
   }
 
   Future<void> _bootstrap() async {
@@ -234,6 +250,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
 
       await _syncFromInbox();
+      await _refreshOverlayPermission();
 
       _telephony.listenIncomingSms(
         onNewMessage: _onForegroundSms,
@@ -280,10 +297,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _onForegroundSms(SmsMessage message) async {
     debugPrint('[SMS][fg] received from=${message.address} body=${message.body}');
     final updated = await MessageStore.prepend(_StoredMessage.fromSms(message));
-    await NotificationService.showCaptured(
-      sender: message.address ?? 'Unknown',
-      body: message.body ?? '',
-    );
+    final sender = message.address ?? 'Unknown';
+    final body = message.body ?? '';
+    await NotificationService.showCaptured(sender: sender, body: body);
+    await OverlayPopupService.showSmsPopup(sender: sender, body: body);
     if (!mounted) return;
     setState(() => _messages = updated);
   }
@@ -295,6 +312,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         title: const Text('Expense Tracker'),
         centerTitle: true,
         actions: [
+          IconButton(
+            icon: Icon(
+              _overlayPermissionGranted
+                  ? Icons.layers
+                  : Icons.layers_clear_outlined,
+            ),
+            tooltip: _overlayPermissionGranted
+                ? 'Popup over other apps enabled'
+                : 'Enable popup over other apps',
+            onPressed: _overlayPermissionGranted ? null : _requestOverlayPermission,
+          ),
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: _loading ? null : _bootstrap,
@@ -325,18 +353,67 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     return Padding(
       padding: const EdgeInsets.all(16),
-      child: GridView.builder(
-        itemCount: kCardCount,
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 2,
-          mainAxisSpacing: 16,
-          crossAxisSpacing: 16,
-          childAspectRatio: 0.95,
-        ),
-        itemBuilder: (context, index) {
-          final message = index < _messages.length ? _messages[index] : null;
-          return _MessageCard(index: index, message: message);
-        },
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (!kIsWeb && Platform.isAndroid && !_overlayPermissionGranted)
+            _OverlayPermissionBanner(onEnable: _requestOverlayPermission),
+          Expanded(
+            child: GridView.builder(
+              itemCount: kCardCount,
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                mainAxisSpacing: 16,
+                crossAxisSpacing: 16,
+                childAspectRatio: 0.95,
+              ),
+              itemBuilder: (context, index) {
+                final message = index < _messages.length ? _messages[index] : null;
+                return _MessageCard(index: index, message: message);
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _OverlayPermissionBanner extends StatelessWidget {
+  const _OverlayPermissionBanner({required this.onEnable});
+
+  final VoidCallback onEnable;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primaryContainer,
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.notifications_active_outlined,
+              color: theme.colorScheme.onPrimaryContainer),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              'Allow “Display over other apps” to get a Truecaller-style popup '
+              'every time a message arrives — even when the app is closed.',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onPrimaryContainer,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          FilledButton(
+            onPressed: onEnable,
+            child: const Text('Enable'),
+          ),
+        ],
       ),
     );
   }
